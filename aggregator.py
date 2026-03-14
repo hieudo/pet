@@ -2,74 +2,93 @@ import csv
 import argparse
 import logging
 from pathlib import Path
-from collections import defaultdict
+import heapq
 
+import time
+import tracemalloc
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
+def parse_row(row, idx_campaign, idx_impressions, idx_clicks, idx_spend, idx_conversions):
+    try:
+        campaign_id = row[idx_campaign].strip()
+        if not campaign_id:
+            return None
 
-def safe_int(value: str) -> int:
-    """
-    Convert value to int safely.
-    Empty values -> 0
-    Invalid values -> raise ValueError
-    """
-    if value is None or value == "":
-        return 0
-    return int(value.strip())
+        impressions = int(row[idx_impressions]) if row[idx_impressions] else 0
+        clicks = int(row[idx_clicks]) if row[idx_clicks] else 0
+        spend = float(row[idx_spend]) if row[idx_spend] else 0.0
+        conversions = int(row[idx_conversions]) if row[idx_conversions] else 0
 
-def safe_float(value: str) -> float:
-    if value is None or value == "":
-        return 0.0
-    return float(value.strip())
+        return campaign_id, impressions, clicks, spend, conversions
 
-def process_csv(input_file: str):
-    """
-    Stream CSV file and aggregate metrics by campaign_id
-    """
+    except (ValueError, IndexError):
+        return None
 
-    aggregates = defaultdict(lambda: {
-        "impressions": 0,
-        "clicks": 0,
-        "spend": 0.0,
-        "conversions": 0
-    })
+
+def update_aggregate(aggregates, campaign_id, impressions, clicks, spend, conversions):
+    agg = aggregates.setdefault(campaign_id, [0, 0, 0.0, 0])
+    agg[0] += impressions
+    agg[1] += clicks
+    agg[2] += spend
+    agg[3] += conversions
+
+
+def compute_metrics(impr, clk, spend, conv):
+    ctr = clk / impr if impr > 0 else 0
+    cpa = spend / conv if conv > 0 else None
+    return ctr, cpa
+
+
+# ---------------------------
+# Core logic
+# ---------------------------
+def process_rows(reader):
+    aggregates = {}
 
     processed_rows = 0
     skipped_rows = 0
 
-    with open(input_file, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+    header = next(reader)
 
-        for row in reader:
-            processed_rows += 1
+    idx_campaign = header.index("campaign_id")
+    idx_impressions = header.index("impressions")
+    idx_clicks = header.index("clicks")
+    idx_spend = header.index("spend")
+    idx_conversions = header.index("conversions")
 
-            try:
-                campaign_id = (row.get("campaign_id") or "").strip()
-                if not campaign_id:
-                    skipped_rows += 1
-                    continue
+    agg_setdefault = aggregates.setdefault
 
-                impressions = safe_int(row.get("impressions"))
-                clicks = safe_int(row.get("clicks"))
-                spend = safe_float(row.get("spend"))
-                conversions = safe_int(row.get("conversions"))
+    for row in reader:
+        processed_rows += 1
 
-                agg = aggregates[campaign_id]
-                agg["impressions"] += impressions
-                agg["clicks"] += clicks
-                agg["spend"] += spend
-                agg["conversions"] += conversions
+        parsed = parse_row(
+            row,
+            idx_campaign,
+            idx_impressions,
+            idx_clicks,
+            idx_spend,
+            idx_conversions
+        )
 
-            except ValueError:
-                skipped_rows += 1
-                continue
+        if parsed is None:
+            skipped_rows += 1
+            continue
 
-            if processed_rows % 10000 == 0:
-                logging.info("Processed %d rows", processed_rows)
+        campaign_id, impressions, clicks, spend, conversions = parsed
+
+        # inline update (avoid extra call overhead in hot loop if needed)
+        agg = agg_setdefault(campaign_id, [0, 0, 0.0, 0])
+        agg[0] += impressions
+        agg[1] += clicks
+        agg[2] += spend
+        agg[3] += conversions
+
+        if processed_rows % 100000 == 0:
+            logging.info("Processed %d rows", processed_rows)
 
     logging.info("Finished processing")
     logging.info("Processed rows: %d", processed_rows)
@@ -78,94 +97,162 @@ def process_csv(input_file: str):
     return aggregates
 
 
-def compute_metrics(aggregates: dict):
+def process_csv(input_file: str):
+    with open(input_file, "r", newline="", buffering=1024 * 1024) as f:
+        reader = csv.reader(f)
+        return process_rows(reader)
+
+
+# ---------------------------
+# Ranking logic
+# ---------------------------
+def compute_top_n(aggregates: dict, top_n: int = 10):
     """
-    Compute CTR and CPA for each campaign
+    Compute CTR and CPA and maintain top-N rankings using heaps.
     """
+    top_ctr = []
+    top_cpa = []
 
-    results = []
+    for campaign_id, (impr, clk, spend, conv) in aggregates.items():
 
-    for campaign_id, data in aggregates.items():
-        impressions = data["impressions"]
-        clicks = data["clicks"]
-        spend = data["spend"]
-        conversions = data["conversions"]
+        ctr, cpa = compute_metrics(impr, clk, spend, conv)
+        data = (campaign_id, impr, clk, spend, conv, ctr, cpa)
 
-        ctr = clicks / impressions if impressions > 0 else 0
-        cpa = spend / conversions if conversions > 0 else None
+        # --- TOP CTR ---
+        entry_ctr = (ctr, data)
+        if len(top_ctr) < top_n:
+            heapq.heappush(top_ctr, entry_ctr)
+        else:
+            heapq.heappushpop(top_ctr, entry_ctr)
 
-        results.append({
-            "campaign_id": campaign_id,
-            "total_impressions": impressions,
-            "total_clicks": clicks,
-            "total_spend": spend,
-            "total_conversions": conversions,
-            "ctr": ctr,
-            "cpa": cpa
-        })
+        # --- TOP CPA ---
+        if cpa is not None:
+            entry_cpa = (-cpa, data)
+            if len(top_cpa) < top_n:
+                heapq.heappush(top_cpa, entry_cpa)
+            else:
+                heapq.heappushpop(top_cpa, entry_cpa)
 
-    return results
-
-
-def write_csv(filepath: Path, rows: list):
-    """
-    Write output CSV
-    """
-
-    fieldnames = [
-        "campaign_id",
-        "total_impressions",
-        "total_clicks",
-        "total_spend",
-        "total_conversions",
-        "ctr",
-        "cpa"
-    ]
-
-    with open(filepath, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-
-        for row in rows:
-            writer.writerow(row)
+    return top_ctr, top_cpa
 
 
-def generate_rankings(results: list, output_dir: Path):
-    """
-    Generate top10 CTR and top10 CPA reports
-    """
+def fmt_money(value: float) -> str:
+    return f"{value:.2f}"
 
-    # Top CTR (descending)
-    top_ctr = sorted(results, key=lambda x: x["ctr"], reverse=True)[:10]
 
-    # Top CPA (ascending) — exclude campaigns with 0 conversions
-    cpa_candidates = [r for r in results if r["cpa"] is not None]
-    top_cpa = sorted(cpa_candidates, key=lambda x: x["cpa"])[:10]
+def fmt_ctr(value: float) -> str:
+    return f"{value:.4f}"
 
-    write_csv(output_dir / "top10_ctr.csv", top_ctr)
-    write_csv(output_dir / "top10_cpa.csv", top_cpa)
+
+def fmt_cpa(value) -> str:
+    return f"{value:.2f}" if value != "" else ""
+
+
+# ---------------------------
+# Output (I/O only)
+# ---------------------------
+def write_ctr(filepath: Path, rows):
+    with open(filepath, "w", newline="") as f:
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "campaign_id",
+            "total_impressions",
+            "total_clicks",
+            "total_spend",
+            "total_conversions",
+            "ctr",
+            "cpa"
+        ])
+
+        for _, data in sorted(rows, reverse=True):
+            cid, impr, clk, spend, conv, ctr, cpa = data
+
+            writer.writerow([
+                cid,
+                impr,
+                clk,
+                fmt_money(spend),
+                conv,
+                fmt_ctr(ctr),
+                fmt_cpa(cpa if cpa is not None else "")
+            ])
+
+
+def write_cpa(filepath: Path, rows):
+    with open(filepath, "w", newline="") as f:
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "campaign_id",
+            "total_impressions",
+            "total_clicks",
+            "total_spend",
+            "total_conversions",
+            "ctr",
+            "cpa"
+        ])
+
+        for _, data in sorted(rows, reverse=True):
+            cid, impr, clk, spend, conv, ctr, cpa = data
+
+            writer.writerow([
+                cid,
+                impr,
+                clk,
+                fmt_money(spend),
+                conv,
+                fmt_ctr(ctr),
+                fmt_cpa(cpa)
+            ])
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Aggregate campaign metrics from large CSV")
-    parser.add_argument("--input", required=True, help="Input CSV file")
-    parser.add_argument("--output", required=True, help="Output directory")
+    parser = argparse.ArgumentParser(description="Large CSV Campaign Aggregator")
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=10,
+        help="Number of top campaigns to output"
+    )
+    parser.add_argument(
+        "--measure-memory",
+        action="store_true",
+        help="Enable memory measurement (slower)"
+    )
 
     args = parser.parse_args()
 
-    input_file = args.input
+    start_time = time.perf_counter()
+    # To measurement memory usage
+    if args.measure_memory:
+        tracemalloc.start()
+
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logging.info("Starting CSV processing")
+    logging.info("Starting processing")
 
-    aggregates = process_csv(input_file)
+    aggregates = process_csv(args.input)
 
-    results = compute_metrics(aggregates)
+    top_ctr, top_cpa = compute_top_n(aggregates)
 
-    generate_rankings(results, output_dir)
+    write_ctr(output_dir / "top10_ctr.csv", top_ctr)
+    write_cpa(output_dir / "top10_cpa.csv", top_cpa)
 
-    logging.info("Reports generated in %s", output_dir)
+    logging.info("Reports written to %s", output_dir)
+
+    end_time = time.perf_counter()
+    elapsed = end_time - start_time
+
+    logging.info("Processing time: %.2f seconds", elapsed)
+    # To measurement memory usage
+    if args.measure_memory:
+        current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        logging.info("Peak memory usage: %.2f MB", peak / (1024 * 1024))
 
 
 if __name__ == "__main__":
